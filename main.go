@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -42,26 +43,96 @@ func main() {
 	}
 
 	var mux http.ServeMux
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !basicAuth.IsAuthorized(r) {
+	{
+		configs, err := azureGitClient.GetConfigs()
+		if err != nil {
+			panic(err)
+		}
+		log.Println("available configurations:", configs)
+		for _, config := range configs {
+			mux.HandleFunc("/"+config+".yml",
+				makeYamlConfigHandler(config, &basicAuth, &azureGitClient))
+			mux.HandleFunc("/"+config+".json",
+				makeJsonConfigHandler(config, &basicAuth, &azureGitClient))
+			mux.HandleFunc("/"+config+"/",
+				makeSpringConfigHandler(config, &basicAuth, &azureGitClient))
+		}
+	}
+	log.Println("started in", time.Since(start), "and listening at", listen)
+	if err := http.ListenAndServe(listen, &mux); err != nil {
+		panic(err)
+	}
+}
+
+func makeYamlConfigHandler(config string, ba *BasicAuth, agg *AzureGitClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !ba.IsAuthorized(r) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 			http.Error(w, "", http.StatusUnauthorized)
 			return
 		}
-		u := r.URL.Path[1:]
-		var configName string
-		if slash := strings.IndexByte(u, '/'); slash != -1 {
-			configName = u[:slash]
-		} else {
-			configName = u
-		}
-		item, err := azureGitClient.GetItem(configName + ".yml")
+		item, err := agg.GetItem(config + ".yml")
 		if err != nil {
+			log.Println(err)
 			http.Error(w, "", http.StatusInternalServerError)
 			return
 		}
-		configset, err := azureGitClient.DownloadConfig(item.URL)
+		w.Header().Set("Content-Type", "application/yaml")
+		w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
+		if err := agg.DownloadConfigTo(item.URL, w); err != nil {
+			log.Println(err)
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
+func makeJsonConfigHandler(config string, ba *BasicAuth, agg *AzureGitClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !ba.IsAuthorized(r) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(w, "", http.StatusUnauthorized)
+			return
+		}
+		item, err := agg.GetItem(config + ".yml")
 		if err != nil {
+			log.Println(err)
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+		configset, err := agg.DownloadConfig(item.URL)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+		jsonized := jsonize(configset)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
+		if err := json.NewEncoder(w).Encode(jsonized); err != nil {
+			log.Println(err)
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
+func makeSpringConfigHandler(config string, ba *BasicAuth, agg *AzureGitClient) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !ba.IsAuthorized(r) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(w, "", http.StatusUnauthorized)
+			return
+		}
+		item, err := agg.GetItem(config + ".yml")
+		if err != nil {
+			log.Println(err)
+			http.Error(w, "", http.StatusInternalServerError)
+			return
+		}
+		configset, err := agg.DownloadConfig(item.URL)
+		if err != nil {
+			log.Println(err)
 			http.Error(w, "", http.StatusInternalServerError)
 			return
 		}
@@ -78,12 +149,12 @@ func main() {
 			State           interface{}      `json:"state"`
 			PropertySources []PropertySource `json:"propertySources"`
 		}{
-			Name:     configName,
+			Name:     config,
 			Profiles: []string{"default"},
 			Version:  item.CommitID,
 			PropertySources: []PropertySource{
 				PropertySource{
-					Name:   configName + ".yml",
+					Name:   config + ".yml",
 					Source: flattened,
 				},
 			},
@@ -91,13 +162,10 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
 		if err := json.NewEncoder(w).Encode(cloudConfigAnswer); err != nil {
+			log.Println(err)
 			http.Error(w, "", http.StatusInternalServerError)
 			return
 		}
-	})
-	log.Println("started in", time.Since(start), "and listening at", listen)
-	if err := http.ListenAndServe(listen, &mux); err != nil {
-		panic(err)
 	}
 }
 
@@ -134,6 +202,46 @@ func makeAzureGitClient(config AzureGitConfig) AzureGitClient {
 			Timeout: 5 * time.Second,
 		},
 	}
+}
+
+func (agc *AzureGitClient) GetConfigs() ([]string, error) {
+	vals := url.Values{
+		"api-version":    []string{"5.1"},
+		"recursionLevel": []string{"oneLevel"},
+	}
+	req, err := http.NewRequest("GET", agc.basePath+vals.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.SetBasicAuth("Personal Access Token", agc.token)
+	r, err := agc.cli.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if r.StatusCode != http.StatusOK {
+		r.Body.Close()
+		return nil, errors.New("status not ok")
+	}
+	var results struct {
+		Value []struct {
+			Path string `json:"path"`
+		} `json:"value"`
+	}
+	err = json.NewDecoder(r.Body).Decode(&results)
+	r.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	configs := make([]string, 0, len(results.Value))
+	for _, value := range results.Value {
+		if !strings.HasSuffix(value.Path, ".yml") {
+			continue
+		}
+		p := value.Path[1 : len(value.Path)-len(".yml")]
+		configs = append(configs, p)
+	}
+	return configs, nil
 }
 
 func (agc *AzureGitClient) GetItem(path string) (Item, error) {
@@ -186,6 +294,25 @@ func (agc *AzureGitClient) DownloadConfig(path string) (map[interface{}]interfac
 	return configset, err
 }
 
+func (agc *AzureGitClient) DownloadConfigTo(path string, w io.Writer) error {
+	req, err := http.NewRequest("GET", path, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth("Personal Access Token", agc.token)
+	r, err := agc.cli.Do(req)
+	if err != nil {
+		return err
+	}
+	if r.StatusCode != http.StatusOK {
+		r.Body.Close()
+		return errors.New("status not ok")
+	}
+	_, err = io.Copy(w, r.Body)
+	r.Body.Close()
+	return err
+}
+
 type Item struct {
 	CommitID string `json:"commitId"`
 	URL      string `json:"url"`
@@ -219,4 +346,17 @@ func flattenMap(m map[interface{}]interface{}) map[string]interface{} {
 		}
 	}
 	return o
+}
+
+func jsonize(m map[interface{}]interface{}) map[string]interface{} {
+	res := map[string]interface{}{}
+	for k, v := range m {
+		switch v2 := v.(type) {
+		case map[interface{}]interface{}:
+			res[fmt.Sprint(k)] = jsonize(v2)
+		default:
+			res[fmt.Sprint(k)] = v
+		}
+	}
+	return res
 }
