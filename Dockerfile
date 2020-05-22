@@ -7,5 +7,4 @@ RUN go get -v -ldflags="-s -w"
 FROM alpine:latest
 WORKDIR /srv/app/
 COPY --from=build /go/bin/app /srv/app/
-COPY application.json /srv/app/
 CMD ["/srv/app/app"]

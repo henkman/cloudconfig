@@ -17,30 +17,18 @@ import (
 
 func main() {
 	start := time.Now()
-	var (
-		listen         string
-		basicAuth      BasicAuth
-		azureGitClient AzureGitClient
-	)
-	{
-		var config struct {
-			Listen         string         `json:"listen"`
-			BasicAuth      BasicAuth      `json:"basicAuth`
-			AzureGitConfig AzureGitConfig `json:"azure"`
-		}
-		fd, err := os.Open("application.json")
-		if err != nil {
-			panic(err)
-		}
-		err = json.NewDecoder(fd).Decode(&config)
-		fd.Close()
-		if err != nil {
-			panic(err)
-		}
-		listen = config.Listen
-		basicAuth = config.BasicAuth
-		azureGitClient = makeAzureGitClient(config.AzureGitConfig)
+
+	listen := os.Getenv("LISTEN_ADDRESS")
+	basicAuth := BasicAuth{
+		Username: os.Getenv("SPRING_CLOUD_USER"),
+		Password: os.Getenv("SPRING_CLOUD_PASSWORD"),
 	}
+	azureGitClient := makeAzureGitClient(AzureGitConfig{
+		Token:        os.Getenv("GIT_TOKEN"),
+		Organization: os.Getenv("GIT_ORGANIZATION"),
+		Project:      os.Getenv("GIT_PROJECT"),
+		Repository:   os.Getenv("GIT_REPOSITORY"),
+	})
 
 	var mux http.ServeMux
 	{
@@ -106,10 +94,10 @@ func makeJsonConfigHandler(config string, ba *BasicAuth, agg *AzureGitClient) ht
 			http.Error(w, "", http.StatusInternalServerError)
 			return
 		}
-		jsonized := jsonize(configset)
+		stringified := stringifyMap(configset)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
-		if err := json.NewEncoder(w).Encode(jsonized); err != nil {
+		if err := json.NewEncoder(w).Encode(stringified); err != nil {
 			log.Println(err)
 			http.Error(w, "", http.StatusInternalServerError)
 			return
@@ -342,21 +330,34 @@ func flattenMap(m map[interface{}]interface{}) map[string]interface{} {
 			} else {
 				o[k.(string)] = v
 			}
-
 		}
 	}
 	return o
 }
 
-func jsonize(m map[interface{}]interface{}) map[string]interface{} {
+func stringifyMap(m map[interface{}]interface{}) map[string]interface{} {
 	res := map[string]interface{}{}
 	for k, v := range m {
 		switch v2 := v.(type) {
 		case map[interface{}]interface{}:
-			res[fmt.Sprint(k)] = jsonize(v2)
+			res[fmt.Sprint(k)] = stringifyMap(v2)
+		case []interface{}:
+			res[fmt.Sprint(k)] = stringifySlice(v2)
 		default:
 			res[fmt.Sprint(k)] = v
 		}
 	}
 	return res
+}
+
+func stringifySlice(s []interface{}) []interface{} {
+	for i, el := range s {
+		switch v2 := el.(type) {
+		case map[interface{}]interface{}:
+			s[i] = stringifyMap(v2)
+		case []interface{}:
+			s[i] = stringifySlice(v2)
+		}
+	}
+	return s
 }
